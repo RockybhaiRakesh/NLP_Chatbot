@@ -1,0 +1,348 @@
+import re
+import streamlit as st
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
+import time
+import pandas as pd
+from datetime import datetime
+
+# Load API key
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    st.error("❌ GEMINI_API_KEY not found in .env")
+    st.stop()
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Initialize session state
+if 'search_history' not in st.session_state:
+    st.session_state.search_history = []
+if 'file_content' not in st.session_state:
+    st.session_state.file_content = None
+
+@st.cache_data(show_spinner=False)
+def semantic_keywords_gemini(query, max_keywords=20):
+    """Extract search keywords using Gemini with retry mechanism"""
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    prompt = f"""
+Extract the top {max_keywords} most important keywords from this question that would help search a text file.
+Focus on specific nouns, names, and meaningful phrases. Exclude common words.
+
+Query: "{query}"
+
+Respond as a Python list: ["keyword1", "keyword2", ...]
+"""
+    for attempt in range(3):
+        try:
+            response = model.generate_content(prompt)
+            match = re.findall(r'\[.*?\]', response.text)
+            if match:
+                keywords = eval(match[0])
+                return keywords[:max_keywords]
+        except Exception as e:
+            if attempt == 2:
+                st.error(f"Keyword extraction failed: {e}")
+                # Fallback: simple keyword extraction
+                words = re.findall(r'\b[a-zA-Z]{4,}\b', query)
+                return words[:10] if words else [query]
+            time.sleep(1)
+    return []
+
+def smart_text_chunking(text, chunk_size=1000):
+    """Split text at sentence boundaries for better processing"""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk + sentence) <= chunk_size:
+            current_chunk += sentence + " "
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+def advanced_search(file_content, keywords, snippet_length=150):
+    """Enhanced search with ranking and better context"""
+    if not keywords:
+        return "No keywords found."
+
+    results = []
+    
+    for keyword in keywords:
+        pattern = re.escape(keyword)
+        matches = list(re.finditer(pattern, file_content, re.IGNORECASE))
+        
+        for match in matches:
+            # Calculate start and end with boundaries
+            start = max(match.start() - snippet_length, 0)
+            end = min(match.end() + snippet_length, len(file_content))
+            
+            # Adjust to nearest word boundaries
+            while start > 0 and file_content[start] not in (' ', '\n', '\t'):
+                start -= 1
+            while end < len(file_content) and file_content[end] not in (' ', '\n', '\t'):
+                end += 1
+            
+            snippet = file_content[start:end].strip()
+            
+            # Calculate relevance score
+            score = len(keyword) * 2  # Longer keywords are more important
+            if snippet.lower().count(keyword.lower()) > 1:
+                score *= 1.5  # Multiple occurrences boost score
+            
+            results.append({
+                'score': score,
+                'snippet': f"...{snippet}...",
+                'keyword': keyword
+            })
+    
+    # Sort by score and remove duplicates
+    results.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Remove similar snippets
+    unique_snippets = []
+    seen_content = set()
+    
+    for result in results:
+        content_hash = hash(result['snippet'][:100])  # Check first 100 chars for similarity
+        if content_hash not in seen_content:
+            seen_content.add(content_hash)
+            unique_snippets.append(result['snippet'])
+    
+    return "\n\n".join(unique_snippets[:10]) if unique_snippets else "No matches found."
+
+def get_confidence_score(keywords, context, question):
+    """Calculate confidence level for the answer"""
+    if not keywords or "No matches" in context:
+        return "❌ Low Confidence (No relevant content found)"
+    
+    # Calculate keyword coverage
+    context_lower = context.lower()
+    matched_keywords = [k for k in keywords if k.lower() in context_lower]
+    coverage = len(matched_keywords) / len(keywords)
+    
+    # Calculate context richness
+    context_length = len(context)
+    
+    if coverage >= 0.7 and context_length > 500:
+        return "✅ High Confidence"
+    elif coverage >= 0.4:
+        return "⚠️ Medium Confidence"
+    else:
+        return "❓ Low Confidence"
+
+@st.cache_data(show_spinner=False)
+def ask_gemini(question, context, temperature=0.7):
+    """Ask Gemini to answer based on the text file content with enhanced prompting"""
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    
+    prompt = f"""
+You are a helpful assistant that answers questions based ONLY on the provided text content.
+If the answer cannot be found in the text, clearly state "I cannot find this information in the provided text."
+
+QUESTION: {question}
+
+TEXT CONTENT:
+{context}
+
+INSTRUCTIONS:
+1. Answer concisely but thoroughly based ONLY on the text above
+2. If the text doesn't contain the answer, say so
+3. Include relevant details, names, numbers, or quotes when available
+4. Do not add information not present in the text
+5. If multiple relevant points exist, list them clearly
+
+ANSWER:
+"""
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=temperature
+            )
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"Error generating answer: {e}"
+
+def export_search_history():
+    """Export search history to CSV"""
+    if not st.session_state.search_history:
+        return None
+    
+    df_data = []
+    for entry in st.session_state.search_history:
+        df_data.append({
+            'Timestamp': entry['timestamp'],
+            'Question': entry['question'],
+            'Keywords': ', '.join(entry['keywords']),
+            'Answer': entry['answer'],
+            'Confidence': entry['confidence']
+        })
+    
+    return pd.DataFrame(df_data).to_csv(index=False)
+
+def main():
+    st.set_page_config(
+        page_title="🔍 Smart Text File Search Pro",
+        page_icon="🤖",
+        layout="wide"
+    )
+    
+    st.title("🔍 Smart Text File Search Pro")
+    st.markdown("Upload text files and ask questions - AI will find the answers! 🤖")
+    
+    # Sidebar for settings and history
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        max_keywords = st.slider("Max Keywords", 5, 30, 20)
+        snippet_length = st.slider("Snippet Length", 50, 300, 150)
+        model_temperature = st.slider("AI Creativity", 0.0, 1.0, 0.7)
+        
+        st.header("📊 Search History")
+        if st.session_state.search_history:
+            for i, entry in enumerate(reversed(st.session_state.search_history[-5:])):
+                with st.expander(f"Q: {entry['question'][:50]}..."):
+                    st.write(f"**Time:** {entry['timestamp']}")
+                    st.write(f"**Keywords:** {', '.join(entry['keywords'][:5])}")
+                    st.write(f"**Confidence:** {entry['confidence']}")
+        
+        # Export functionality
+        if st.session_state.search_history:
+            csv_data = export_search_history()
+            st.download_button(
+                "📥 Export Full History",
+                csv_data,
+                "search_history.csv",
+                "text/csv"
+            )
+    
+    # Main content area
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("📁 File Upload")
+        uploaded_file = st.file_uploader(
+            "Choose a text file", 
+            type=["txt"],
+            help="Upload any text file to search through its content"
+        )
+        
+        if uploaded_file is not None:
+            file_content = uploaded_file.read().decode("utf-8", errors="ignore")
+            st.session_state.file_content = file_content
+            
+            st.success(f"✅ File uploaded successfully! ({len(file_content):,} characters)")
+            
+            # File stats
+            with st.expander("📊 File Statistics"):
+                words = len(file_content.split())
+                lines = file_content.count('\n') + 1
+                paragraphs = len([p for p in file_content.split('\n\n') if p.strip()])
+                
+                st.metric("Words", f"{words:,}")
+                st.metric("Lines", f"{lines:,}")
+                st.metric("Paragraphs", paragraphs)
+    
+    with col2:
+        st.subheader("❓ Ask Questions")
+        
+        if st.session_state.file_content is None:
+            st.info("👆 Please upload a text file first to start asking questions")
+        else:
+            question = st.text_area(
+                "Enter your question:",
+                placeholder="E.g., What are the main points about artificial intelligence?",
+                height=100
+            )
+            
+            if st.button("🔍 Search & Answer", type="primary", use_container_width=True):
+                if not question.strip():
+                    st.warning("Please enter a question")
+                    return
+                
+                # Progress tracking
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Step 1: Extract keywords
+                status_text.text("🔍 Extracting keywords...")
+                progress_bar.progress(25)
+                keywords = semantic_keywords_gemini(question, max_keywords)
+                
+                # Step 2: Search file
+                status_text.text("📖 Searching document...")
+                progress_bar.progress(50)
+                context = advanced_search(st.session_state.file_content, keywords, snippet_length)
+                
+                # Step 3: Generate answer
+                status_text.text("🤖 Generating answer...")
+                progress_bar.progress(75)
+                answer = ask_gemini(question, context, model_temperature)
+                
+                # Step 4: Calculate confidence
+                confidence = get_confidence_score(keywords, context, question)
+                progress_bar.progress(100)
+                status_text.text("✅ Complete!")
+                
+                # Store in history
+                st.session_state.search_history.append({
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'question': question,
+                    'keywords': keywords,
+                    'answer': answer,
+                    'confidence': confidence
+                })
+                
+                # Display results
+                st.subheader("🎯 Results")
+                
+                # Confidence indicator
+                if "High" in confidence:
+                    st.success(confidence)
+                elif "Medium" in confidence:
+                    st.warning(confidence)
+                else:
+                    st.error(confidence)
+                
+                # Keywords used
+                with st.expander("🔑 Extracted Keywords", expanded=False):
+                    cols = st.columns(4)
+                    for i, keyword in enumerate(keywords):
+                        cols[i % 4].markdown(f"`{keyword}`")
+                
+                # Matching snippets
+                if "No matches" not in context:
+                    with st.expander("📝 Relevant Text Snippets", expanded=False):
+                        st.text_area("Snippets", context, height=200, label_visibility="collapsed")
+                
+                # Final answer
+                st.subheader("💡 Answer")
+                st.write(answer)
+                
+                # Export current answer
+                answer_data = f"Question: {question}\n\nAnswer: {answer}\n\nConfidence: {confidence}\n\nKeywords: {', '.join(keywords)}"
+                st.download_button(
+                    "📥 Download This Answer",
+                    answer_data,
+                    f"answer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    "text/plain"
+                )
+
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "Built with ❤️ using Streamlit & Google Gemini AI | "
+        "💡 **Tip**: Ask specific questions for better results!"
+    )
+
+if __name__ == "__main__":
+    main()
